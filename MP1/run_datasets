@@ -1,10 +1,12 @@
 #!/bin/bash
 
 mkdir -p bench
+rm MP1
+cp ../build/MP1 .
 
 for i in 0 1 2 3 4 5 6 7 8 9;
 do
 	echo "--------------";
 	echo "Dataset " $i 
-	./template -e ./data/${i}/output.raw -i ./data/${i}/input0.raw,./data/${i}/input1.raw -t vector
+	./MP1 -e ./data/${i}/output.raw -i ./data/${i}/input0.raw,./data/${i}/input1.raw -o ./data/${i}/sol.raw -t vector
 done

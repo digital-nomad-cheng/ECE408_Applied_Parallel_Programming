@@ -34,3 +34,4 @@
 .tmp
 out.txt
 build
+*res.raw

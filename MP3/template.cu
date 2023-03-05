@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 
   //@@ Initialize the grid and block dimensions here
   dim3 blockDim{BLOCK_SIZE, BLOCK_SIZE, 1};
-  dim3 gridDim{ceil(numARows, BLOCK_SIZE), ceil(numBColumns, BLOCK_SIZE), 1};
+  dim3 gridDim{ceil(numBColumns, BLOCK_SIZE), ceil(numARows, BLOCK_SIZE), 1};
 
   wbTime_start(Compute, "Performing CUDA computation");
   //@@ Launch the GPU Kernel here

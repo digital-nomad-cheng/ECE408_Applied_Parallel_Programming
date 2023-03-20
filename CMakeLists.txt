@@ -22,5 +22,7 @@ CUDA_ADD_EXECUTABLE(MP0 MP0/template.cu ${wb_src})
 CUDA_ADD_EXECUTABLE(MP1 MP1/template.cu ${wb_src})
 CUDA_ADD_EXECUTABLE(MP2 MP2/template.cu ${wb_src})
 CUDA_ADD_EXECUTABLE(MP3 MP3/template.cu ${wb_src})
+CUDA_ADD_EXECUTABLE(MP4 MP4/template.cu ${wb_src})
+
 # nvcc MP0/template.cu ${wb_src} -Ilib -o template
 

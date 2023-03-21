@@ -3,8 +3,7 @@
 mkdir -p bench
 rm MP4
 cp ../build/MP4 .
-#for i in 0 1 2 3 4 5;
-for i in 0;
+for i in 0 1 2 3 4 5;
 do
 	echo "--------------";
 	echo "Dataset " $i 

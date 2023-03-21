@@ -30,6 +30,40 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 //@@ Define constant memory for device kernel here
 __constant__ float deviceKernel[MASK_WIDTH][MASK_WIDTH][MASK_WIDTH];
 
+// global memory version
+__global__ void conv3d_navie(float *input, float *output, const int z_size,
+                       const int y_size, const int x_size) {
+  //@@ Insert kernel code here
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
+  int radius = MASK_WIDTH/2;
+  int x_start = x - radius;
+  int y_start = y - radius;
+  int z_start = z - radius;
+  float result = 0.0f;
+  for (int i = 0; i < MASK_WIDTH; i++) {
+    for (int j = 0; j < MASK_WIDTH; j++) {
+      for (int k = 0; k < MASK_WIDTH; k++) {
+        int zz = z_start + i; 
+        int yy = y_start + j;
+        int xx = x_start + k;
+        if ((0 <= xx) && (xx < x_size) && \
+            (0 <= yy) && (yy < y_size) && \
+            (0 <= zz) && (zz < z_size)) {
+            result += input[xx +  yy * x_size + zz * x_size * y_size] * deviceKernel[i][j][k];
+        }
+      }
+    }
+  }
+        
+  if ((0 <= x) && (x < x_size) && \
+      (0 <= y) && (y < y_size) && \
+      (0 <= z) && (z < z_size))
+    output[x+y*x_size+z*x_size*y_size] = result;
+}
+
+// shared memory version
 __global__ void conv3d(float *input, float *output, const int z_size,
                        const int y_size, const int x_size) {
   //@@ Insert kernel code here
@@ -90,7 +124,9 @@ __global__ void conv3d(float *input, float *output, const int z_size,
       }
     }
   }
-  if ((0 <= x) && (x < x_size) && (0 <= y) && (y < y_size) && (0 <= z) && (z < z_size))  
+  if ((0 <= x) && (x < x_size) && \
+      (0 <= y) && (y < y_size) && \
+      (0 <= z) && (z < z_size))  
     output[index] = result;
 }
 

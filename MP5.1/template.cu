@@ -21,6 +21,28 @@ __global__ void total(float *input, float *output, int len) {
   //@@ Traverse the reduction tree
   //@@ Write the computed sum of the block to the output vector at the
   //@@ correct index
+  __shared__ float ds[BLOCK_SIZE*2];
+  int tx = threadIdx.x;
+  int bx = blockIdx.x;
+  int gx = bx * blockDim.x + tx;
+  // load data from global memory into shared memory
+  int start_index = 2 * bx * blockDim.x;
+  if (start_index + tx < len)
+    ds[tx] = input[start_index+tx];
+  else
+    ds[tx] = 0.0f;
+  if (start_index + blockDim.x + tx < len)
+    ds[tx+blockDim.x] = input[start_index+blockDim.x+tx];
+  else
+    ds[tx+blockDim.x] = 0.0f;
+  __syncthreads();
+
+  for (unsigned int stride = blockDim.x; stride >= 1; stride /= 2) {
+    __syncthreads();
+    if (tx < stride) 
+      ds[tx] += ds[tx+stride];
+  }
+  output[bx] = ds[0];
 }
 
 int main(int argc, char **argv) {
@@ -51,24 +73,26 @@ int main(int argc, char **argv) {
 
   wbTime_start(GPU, "Allocating GPU memory.");
   //@@ Allocate GPU memory here
-
+  cudaMalloc((void **)&deviceInput, numInputElements*sizeof(float));
+  cudaMalloc((void **)&deviceOutput, numOutputElements*sizeof(float));
   wbTime_stop(GPU, "Allocating GPU memory.");
 
   wbTime_start(GPU, "Copying input memory to the GPU.");
   //@@ Copy memory to the GPU here
-
+  cudaMemcpy(deviceInput, hostInput, numInputElements*sizeof(float), cudaMemcpyHostToDevice);
   wbTime_stop(GPU, "Copying input memory to the GPU.");
   //@@ Initialize the grid and block dimensions here
-
+  dim3 gridDim{(numInputElements - 1) / BLOCK_SIZE + 1, 1, 1};
+  dim3 blockDim{BLOCK_SIZE, 1, 1};
   wbTime_start(Compute, "Performing CUDA computation");
   //@@ Launch the GPU Kernel here
-
+  total<<<gridDim, blockDim>>>(deviceInput, deviceOutput, numInputElements);
   cudaDeviceSynchronize();
   wbTime_stop(Compute, "Performing CUDA computation");
 
   wbTime_start(Copy, "Copying output memory to the CPU");
   //@@ Copy the GPU memory back to the CPU here
-
+  cudaMemcpy(hostOutput, deviceOutput, numOutputElements*sizeof(float), cudaMemcpyDeviceToHost);
   wbTime_stop(Copy, "Copying output memory to the CPU");
 
   /***********************************************************************

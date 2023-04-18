@@ -31,8 +31,11 @@ void checkCUDAError(const char *msg, int line = -1) {
 }
 
 
+
 #define HISTOGRAM_LENGTH 256
 #define BLOCK_SIZE 16 // for easier histogram cdf scan computation
+
+__constant__ float const_cdf[HISTOGRAM_LENGTH];
 
 //@@ insert code here
 /*
@@ -114,7 +117,7 @@ __global__ void cdf(float *output, const int *input, int width, int height)
   }
 
   // post scan step
-  stride = BLOCK_SIZE / 2;
+  stride = blockDim.x / 2;
   while (stride > 0) {
     __syncthreads();
     int idx = (ti + 1) * stride * 2 - 1;
@@ -124,16 +127,40 @@ __global__ void cdf(float *output, const int *input, int width, int height)
   }
 
   if (ti + start_idx < HISTOGRAM_LENGTH)
-    output[ti + start_idx] = T[ti];
+    output[ti + start_idx] = T[ti] + input[ti] / size;
   if (ti + start_idx + blockDim.x < HISTOGRAM_LENGTH)
-    output[ti + start_idx + blockDim.x] = T[ti + blockDim.x];
-
+    output[ti + start_idx + blockDim.x] = T[ti + blockDim.x] + input[ti + blockDim.x] / size;
 }
 
 /*
  * perform histogram equalization
  */
+// def correct_color(val)
+// 	return clamp(255*(cdf[val] - cdfmin)/(1.0 - cdfmin), 0, 255.0)
+// end
 
+// def clamp(x, start, end)
+// 	return min(max(x, start), end)
+// end
+// __device__ unsigned char 
+__device__ unsigned char correct_color(int val)
+{
+  int tmp = (int) 255.0f * (const_cdf[val] - const_cdf[0]) / (1.0f - const_cdf[0]);
+  return (unsigned char) min(max(0, tmp), 255);
+}
+// }
+__global__ void equalization(unsigned char *output, const unsigned char *input, int width, int height, int channels)
+{
+  int x = blockDim.x * blockIdx.x + threadIdx.x;
+  int y = blockDim.y * blockIdx.y + threadIdx.y;
+  if (x < width && y < height) {
+    int idx = y * width + x;
+    for (int c = 0; c < channels; c++) {
+      int val = (int)input[idx*channels + c];
+      output[idx*channels + c] = correct_color(val);
+    }
+  }
+}
 
 /*
  * unsigned char image to float image
@@ -191,6 +218,7 @@ int main(int argc, char **argv) {
   unsigned char *dev_gray;
   int *dev_hists;
   float *dev_cdf;
+  unsigned char *dev_eq;
   // float *dev_gray_float;
   wbCheck(cudaMalloc((void **)&dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float)));
   wbCheck(cudaMalloc((void **)&dev_uchar, (imageWidth*imageHeight*imageChannels)*sizeof(unsigned char)));
@@ -198,6 +226,7 @@ int main(int argc, char **argv) {
   wbCheck(cudaMalloc((void **)&dev_hists, HISTOGRAM_LENGTH * sizeof(int)));
   wbCheck(cudaMemset(dev_hists, 0, HISTOGRAM_LENGTH * sizeof(int)));
   wbCheck(cudaMalloc((void **)&dev_cdf, HISTOGRAM_LENGTH * sizeof(float)));
+  wbCheck(cudaMalloc((void **)&dev_eq, (imageWidth*imageHeight*imageChannels)*sizeof(unsigned char)));
 
   // cudaMalloc((void **)&dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float));
   
@@ -206,7 +235,7 @@ int main(int argc, char **argv) {
   //@ 2. define kernel launch parameters
   dim3 grid_dim{(imageWidth - 1) / BLOCK_SIZE + 1, (imageHeight - 1) / BLOCK_SIZE + 1, 1};
   dim3 block_dim{BLOCK_SIZE, BLOCK_SIZE, 1};
-  std::cout << grid_dim.x << grid_dim.y << grid_dim.z;
+  
   // algo step 1: float to uchar
   float2uchar<<<grid_dim, block_dim>>>(dev_uchar, dev_float, imageWidth, imageHeight, imageChannels);
   checkCUDAErrorWithLine("Launching float to uchar kernel failed!");
@@ -252,30 +281,29 @@ int main(int argc, char **argv) {
   /*
    * Debugging cdf
    */
-  float *host_cdf;
-  host_cdf = (float *)malloc(HISTOGRAM_LENGTH * sizeof(float));
-  cudaMemcpy(host_cdf, dev_cdf, HISTOGRAM_LENGTH * sizeof(float), cudaMemcpyDeviceToHost);
-  for (int i = 0; i < HISTOGRAM_LENGTH; i++)
-    std::cout << "cdf[" << i << "]: " << host_cdf[i] << std::endl;
-  assert(host_cdf[HISTOGRAM_LENGTH-1] == 1), "Wrong cdf calculation.";
-
+  
+  // float *host_cdf;
+  // host_cdf = (float *)malloc(HISTOGRAM_LENGTH * sizeof(float));
+  // cudaMemcpy(host_cdf, dev_cdf, HISTOGRAM_LENGTH * sizeof(float), cudaMemcpyDeviceToHost);
+  // for (int i = 0; i < HISTOGRAM_LENGTH; i++)
+  //   std::cout << "cdf[" << i << "]: " << host_cdf[i] << std::endl;
+  // assert(host_cdf[HISTOGRAM_LENGTH-1] == 1), "Wrong cdf calculation.";
   
 
-  // cudaDeviceSynchronize();
-  //@ 2. float to unsigned char
-  
-  //@ uchar to float
-  // uchar2float<<<grid_dim, block_dim>>>(dev_gray_float, dev_gray_uchar, imageWidth, imageHeight, imageChannels);
-  //@ copy result from device back to host
-  
-  // wbImage_t outputGrayImage = wbImage_new(imageWidth, imageHeight, imageChannels);
-  // float *hostOutputGrayImageData = wbImage_getData(outputGrayImage);
-  // cudaMemcpy(hostOutputGrayImageData, dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
-  //     cudaMemcpyDeviceToHost);
-  // wbSolution(args, outputGrayImage);
+  // algo step 5: histogram equalization
+  // copy the calcuated cdf to constant memory
+  wbCheck(cudaMemcpyToSymbol(const_cdf, dev_cdf, HISTOGRAM_LENGTH * sizeof(float)));
+  equalization<<<grid_dim, block_dim>>>(dev_eq, dev_uchar, imageWidth, imageHeight, imageChannels);
+  checkCUDAErrorWithLine("Launching equalization kernel failed!");
 
-  // cudaMemcpy(hostOutputImageData, dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
+  // algo step 6: uchar to float
+  uchar2float<<<grid_dim, block_dim>>>(dev_float, dev_eq, imageWidth, imageHeight, imageChannels);
+  checkCUDAErrorWithLine("Launching uchar 2 float kernel failed!");
+
+  cudaMemcpy(hostOutputImageData, dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
       cudaMemcpyDeviceToHost);
+  
+  cudaDeviceSynchronize();
 
   wbSolution(args, outputImage);
 
@@ -284,6 +312,11 @@ int main(int argc, char **argv) {
   // memory cleanup
   cudaFree(dev_float);
   cudaFree(dev_uchar);
+  cudaFree(dev_gray);
+  cudaFree(dev_hists);
+  cudaFree(dev_cdf);
+  cudaFree(dev_eq);
+  
   wbImage_delete(inputImage);
   wbImage_delete(outputImage);
 

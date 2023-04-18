@@ -1,9 +1,38 @@
 // Histogram Equalization
 
 #include <wb.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define wbCheck(stmt)                                                     \
+  do {                                                                    \
+    cudaError_t err = stmt;                                               \
+    if (err != cudaSuccess) {                                             \
+      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
+      return -1;                                                          \
+    }                                                                     \
+  } while (0)
+
+#define checkCUDAErrorWithLine(msg) checkCUDAError(msg, __LINE__)
+
+/**
+* Check for CUDA errors; print and exit if there was a problem.
+*/
+void checkCUDAError(const char *msg, int line = -1) {
+  cudaError_t err = cudaGetLastError();
+  if (cudaSuccess != err) {
+    if (line >= 0) {
+      fprintf(stderr, "Line %d: ", line);
+    }
+    fprintf(stderr, "Cuda error: %s: %s.\n", msg, cudaGetErrorString(err));
+    exit(EXIT_FAILURE);
+  }
+}
+
 
 #define HISTOGRAM_LENGTH 256
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE 16 // for easier histogram cdf scan computation
 
 //@@ insert code here
 /*
@@ -36,20 +65,70 @@ __global__ void rgb2gray(unsigned char *gray, const unsigned char *rgb, int widt
     unsigned char r = rgb[3*idx];
     unsigned char g = rgb[3*idx+1];
     unsigned char b = rgb[3*idx+2];
-    // gray[idx] = (unsigned char) (0.21*r + 0.71*g + 0.07*b);
+    gray[idx] = (unsigned char) (0.21*r + 0.71*g + 0.07*b);
     // For debugging rgb to gray
-    gray[idx*3 + 0] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
-    gray[idx*3 + 1] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
-    gray[idx*3 + 2] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
+    // gray[idx*3 + 0] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
+    // gray[idx*3 + 1] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
+    // gray[idx*3 + 2] =  (unsigned char) (0.21*r + 0.71*g + 0.07*b);
   }
 }
 
 /*
- * compute histogram of gray image
+ * Compute histogram of gray image
  */
-// __global__ void histogram(unsigned char *output, const unsigned char *gray, int w, int h)
-// {
-// }
+__global__ void histogram(int *hists, const unsigned char *gray, int width, int height)
+{
+  int x = blockDim.x * blockIdx.x + threadIdx.x;
+  int y = blockDim.y * blockIdx.y + threadIdx.y;
+  if ( x < width && y < height) {
+    int idx = y * width + x;
+    atomicAdd(&(hists[gray[idx]]), 1);
+  }
+}
+
+/*
+ * Compute cdf using histogram - a inherent inclusive prefix sum problem
+ */
+__global__ void cdf(float *output, const int *input, int width, int height)
+{
+  float size = (float) width * height;
+  __shared__ float T[HISTOGRAM_LENGTH];
+  
+  int bi = blockIdx.x;
+  int ti = threadIdx.x;
+  int start_idx = 2 * bi * blockDim.x;
+  // each thread need two load two elements into shared memory
+  if (ti + start_idx < HISTOGRAM_LENGTH) 
+    T[ti] = input[start_idx + ti] / size;
+  if (ti + start_idx + blockDim.x < HISTOGRAM_LENGTH) 
+    T[ti + blockDim.x] = input[start_idx + blockDim.x + ti] / size;
+
+  // reduction step 
+  int stride = 1;
+  while (stride < HISTOGRAM_LENGTH) {
+    __syncthreads();
+    int idx = (ti + 1) * stride * 2 - 1;
+    if (idx < HISTOGRAM_LENGTH && (idx - stride) >= 0)
+      T[idx] += T[idx-stride];
+    stride *= 2;
+  }
+
+  // post scan step
+  stride = BLOCK_SIZE / 2;
+  while (stride > 0) {
+    __syncthreads();
+    int idx = (ti + 1) * stride * 2 - 1;
+    if ((idx + stride) < HISTOGRAM_LENGTH)
+      T[idx + stride] += T[idx];
+    stride /= 2;
+  }
+
+  if (ti + start_idx < HISTOGRAM_LENGTH)
+    output[ti + start_idx] = T[ti];
+  if (ti + start_idx + blockDim.x < HISTOGRAM_LENGTH)
+    output[ti + start_idx + blockDim.x] = T[ti + blockDim.x];
+
+}
 
 /*
  * perform histogram equalization
@@ -65,16 +144,12 @@ __global__ void uchar2float(float *output, const unsigned char *input, int width
   int y = blockDim.y * blockIdx.y + threadIdx.y;
   if (x < width && y < height) {
     int idx = y * width + x;
-    // output[channels*idx + 0] = \
-    //         (float) (input[channels*idx + 0] / 255.0);
-    // output[channels*idx + 1] = \
-    //         (float) (input[channels*idx + 1] / 255.0);
-    // output[channels*idx + 2] = \
-    //         (float) (input[channels*idx + 2] / 255.0);
-    for (int c = 0; c < channels; c++) {
-      output[channels*idx + c] = \
-            (float) (input[channels*idx + c] / 255.0);
-    }
+    output[channels*idx + 0] = \
+            (float) (input[channels*idx + 0] / 255.0);
+    output[channels*idx + 1] = \
+            (float) (input[channels*idx + 1] / 255.0);
+    output[channels*idx + 2] = \
+            (float) (input[channels*idx + 2] / 255.0);
   }
 }
 
@@ -113,48 +188,104 @@ int main(int argc, char **argv) {
   //@ 1. allocate memory on device
   float *dev_float;
   unsigned char *dev_uchar;
-  unsigned char *dev_gray_uchar;
-  float *dev_gray_float;
-  cudaMalloc((void **)&dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float));
-  cudaMalloc((void **)&dev_uchar, (imageWidth*imageHeight*imageChannels)*sizeof(unsigned char));
-  cudaMalloc((void **)&dev_gray_uchar, (imageWidth*imageHeight*imageChannels)*sizeof(unsigned char));
-  cudaMalloc((void **)&dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float));
+  unsigned char *dev_gray;
+  int *dev_hists;
+  float *dev_cdf;
+  // float *dev_gray_float;
+  wbCheck(cudaMalloc((void **)&dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float)));
+  wbCheck(cudaMalloc((void **)&dev_uchar, (imageWidth*imageHeight*imageChannels)*sizeof(unsigned char)));
+  wbCheck(cudaMalloc((void **)&dev_gray, (imageWidth*imageHeight)*sizeof(unsigned char)));
+  wbCheck(cudaMalloc((void **)&dev_hists, HISTOGRAM_LENGTH * sizeof(int)));
+  wbCheck(cudaMemset(dev_hists, 0, HISTOGRAM_LENGTH * sizeof(int)));
+  wbCheck(cudaMalloc((void **)&dev_cdf, HISTOGRAM_LENGTH * sizeof(float)));
+
+  // cudaMalloc((void **)&dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float));
   
-  cudaMemcpy(dev_float, hostInputImageData, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
-      cudaMemcpyHostToDevice);
+  wbCheck(cudaMemcpy(dev_float, hostInputImageData, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
+      cudaMemcpyHostToDevice));
   //@ 2. define kernel launch parameters
   dim3 grid_dim{(imageWidth - 1) / BLOCK_SIZE + 1, (imageHeight - 1) / BLOCK_SIZE + 1, 1};
   dim3 block_dim{BLOCK_SIZE, BLOCK_SIZE, 1};
-
+  std::cout << grid_dim.x << grid_dim.y << grid_dim.z;
+  // algo step 1: float to uchar
   float2uchar<<<grid_dim, block_dim>>>(dev_uchar, dev_float, imageWidth, imageHeight, imageChannels);
-  rgb2gray<<<grid_dim, block_dim>>>(dev_gray_uchar, dev_uchar, imageWidth, imageHeight,  imageChannels);
+  checkCUDAErrorWithLine("Launching float to uchar kernel failed!");
+
+  // algo step 2: rgb to gray
+  rgb2gray<<<grid_dim, block_dim>>>(dev_gray, dev_uchar, imageWidth, imageHeight,  imageChannels);
+  checkCUDAErrorWithLine("Launching rgb to gray kernel failed!");
   
-  cudaDeviceSynchronize();
+  /*
+   * Debugging rgb 2 gray
+   */
+  
+  /*
+  unsigned char *host_gray;
+  host_gray = (unsigned char *)malloc(imageWidth * imageHeight * sizeof(unsigned char));
+  cudaMemcpy(host_gray,dev_gray, imageWidth * imageHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+  for (int y = 0; y < 9; y++) {
+    std::cout << std::endl;
+    for (int x = 0; x < 9; x++) {
+      std::cout << (int)host_gray[y * imageWidth + x] << " ";
+    }
+  }
+  */
+
+  // algo step 3: compute histogram using gray image
+  histogram<<<grid_dim, block_dim>>>(dev_hists, dev_gray, imageWidth, imageHeight); 
+  checkCUDAErrorWithLine("Launching histogram kernel failed!");
+  /*
+   * Debugging histogram
+   */ 
+  
+  /*
+  int *host_hists;
+  host_hists = (int *)malloc(HISTOGRAM_LENGTH * sizeof(int));
+  cudaMemcpy(host_hists, dev_hists, HISTOGRAM_LENGTH * sizeof(int), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < HISTOGRAM_LENGTH; i++)
+    std::cout << "hist[" << i << "]: " << host_hists[i] << std::endl;
+  */
+
+  // algo step 4: compute cfg using histogram
+  cdf<<<1, HISTOGRAM_LENGTH/2>>>(dev_cdf, dev_hists, imageWidth, imageHeight);
+  checkCUDAErrorWithLine("Launching cdf kernel failed!");
+  /*
+   * Debugging cdf
+   */
+  float *host_cdf;
+  host_cdf = (float *)malloc(HISTOGRAM_LENGTH * sizeof(float));
+  cudaMemcpy(host_cdf, dev_cdf, HISTOGRAM_LENGTH * sizeof(float), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < HISTOGRAM_LENGTH; i++)
+    std::cout << "cdf[" << i << "]: " << host_cdf[i] << std::endl;
+  assert(host_cdf[HISTOGRAM_LENGTH-1] == 1), "Wrong cdf calculation.";
+
+  
+
+  // cudaDeviceSynchronize();
   //@ 2. float to unsigned char
   
   //@ uchar to float
-  uchar2float<<<grid_dim, block_dim>>>(dev_gray_float, dev_gray_uchar, imageWidth, imageHeight, imageChannels);
+  // uchar2float<<<grid_dim, block_dim>>>(dev_gray_float, dev_gray_uchar, imageWidth, imageHeight, imageChannels);
   //@ copy result from device back to host
   
-  wbImage_t outputGrayImage = wbImage_new(imageWidth, imageHeight, imageChannels);
-  float *hostOutputGrayImageData = wbImage_getData(outputGrayImage);
-  cudaMemcpy(hostOutputGrayImageData, dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
-      cudaMemcpyDeviceToHost);
-  
-  wbSolution(args, outputGrayImage);
+  // wbImage_t outputGrayImage = wbImage_new(imageWidth, imageHeight, imageChannels);
+  // float *hostOutputGrayImageData = wbImage_getData(outputGrayImage);
+  // cudaMemcpy(hostOutputGrayImageData, dev_gray_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
+  //     cudaMemcpyDeviceToHost);
+  // wbSolution(args, outputGrayImage);
 
   // cudaMemcpy(hostOutputImageData, dev_float, (imageWidth*imageHeight*imageChannels)*sizeof(float), \
       cudaMemcpyDeviceToHost);
-  
-  cudaDeviceSynchronize();
 
-  // wbSolution(args, outputImage);
-  
+  wbSolution(args, outputImage);
+
+
+  //@@ insert code here
+  // memory cleanup
   cudaFree(dev_float);
   cudaFree(dev_uchar);
   wbImage_delete(inputImage);
   wbImage_delete(outputImage);
-  //@@ insert code here
 
   return 0;
 }
